@@ -142,8 +142,7 @@ impl RawEnvelope {
       }
     }
 
-    envelopes.extend(pathology_envelopes);
-    envelopes
+    pathology_envelopes
   }
 
   fn from_tapscript(tapscript: &Script, input: usize) -> Result<Vec<Self>> {
