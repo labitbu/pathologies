@@ -69,7 +69,7 @@ impl Chain {
 
   pub(crate) fn first_pathology_height(self) -> u32 {
     match self {
-      Self::Mainnet => 908070,
+      Self::Mainnet => 908072,
       Self::Regtest => 120,
       Self::Signet => 270000,
       Self::Testnet => 5000000,
