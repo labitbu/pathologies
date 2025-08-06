@@ -24,6 +24,7 @@ pub struct Envelope<T> {
   pub payload: T,
   pub pushnum: bool,
   pub stutter: bool,
+  pub pathology: bool,
 }
 
 impl From<RawEnvelope> for ParsedEnvelope {
@@ -87,6 +88,7 @@ impl From<RawEnvelope> for ParsedEnvelope {
       offset: envelope.offset,
       pushnum: envelope.pushnum,
       stutter: envelope.stutter,
+      pathology: envelope.pathology,
     }
   }
 }
@@ -103,15 +105,44 @@ impl ParsedEnvelope {
 impl RawEnvelope {
   pub fn from_transaction(transaction: &Transaction) -> Vec<Self> {
     let mut envelopes = Vec::new();
+    let mut pathology_envelopes = Vec::new();
 
     for (i, input) in transaction.input.iter().enumerate() {
+      let mut offset: usize = 0;
+
       if let Some(tapscript) = unversioned_leaf_script_from_witness(&input.witness) {
         if let Ok(input_envelopes) = Self::from_tapscript(tapscript, i) {
+          offset += input_envelopes.len();
           envelopes.extend(input_envelopes);
+        }
+      }
+
+      if input.witness.len() >= 3 {
+        let second_witness_item = &input.witness[2];
+
+        if second_witness_item.len() == 4129 {
+          let target_key =
+            hex::decode("96053db5b18967b5a410326ecca687441579225a6d190f398e2180deec6e429e")
+              .unwrap();
+
+          if second_witness_item
+            .windows(target_key.len())
+            .any(|w| w == target_key.as_slice())
+          {
+            pathology_envelopes.push(Self {
+              input: i.try_into().unwrap(),
+              offset: offset.try_into().unwrap(),
+              payload: vec![second_witness_item.to_vec()],
+              pushnum: false,
+              stutter: false,
+              pathology: true,
+            });
+          }
         }
       }
     }
 
+    envelopes.extend(pathology_envelopes);
     envelopes
   }
 
@@ -177,6 +208,7 @@ impl RawEnvelope {
               payload,
               pushnum,
               stutter,
+              pathology: false,
             }),
           ));
         }

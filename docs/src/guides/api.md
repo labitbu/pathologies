@@ -1314,7 +1314,8 @@ curl -s -H "Accept: application/json" \
         "unrecognized_even_field": false
       },
       "pushnum": false,
-      "stutter": false
+      "stutter": false,
+      "pathology": false
     }
   ],
   "runestone": null
