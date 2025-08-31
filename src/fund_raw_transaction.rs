@@ -100,7 +100,7 @@ pub(crate) fn fund_raw_transaction(
       .consensus_encode(&mut buffer)?;
   }
 
-  let options = Some(&FundRawTransactionOptions {
+  let options = FundRawTransactionOptions {
     // NB. This is `fundrawtransaction`'s `feeRate`, which is fee per kvB
     // and *not* fee per vB. So, we multiply the fee rate given by the user
     // by 1000.
@@ -108,11 +108,11 @@ pub(crate) fn fund_raw_transaction(
     change_position: Some(unfunded_transaction.output.len().try_into()?),
     input_weights,
     ..default()
-  });
+  };
 
   let arguments = [
     buffer.raw_hex().into(),
-    opt_into_json(options)?,
+    opt_into_json(Some(options))?,
     opt_into_json(Some(false))?,
   ];
 

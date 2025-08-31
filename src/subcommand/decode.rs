@@ -82,7 +82,9 @@ impl Decode {
       Transaction::consensus_decode(&mut io::BufReader::new(io::stdin()))?
     };
 
-    let inscriptions = ParsedEnvelope::from_transaction(&transaction);
+    let index = Index::open(&settings)?;
+
+    let inscriptions = ParsedEnvelope::from_transaction(&transaction, &index);
 
     let runestone = Runestone::decipher(&transaction);
 

@@ -1151,15 +1151,17 @@ mod tests {
     )
     .unwrap();
 
+    let index = index::Index::open(&settings::Settings::default()).unwrap();
+
     assert_eq!(
       vec![parent],
-      ParsedEnvelope::from_transaction(&reveal_tx)[0]
+      ParsedEnvelope::from_transaction(&reveal_tx, &index)[0]
         .payload
         .parents(),
     );
     assert_eq!(
       vec![parent],
-      ParsedEnvelope::from_transaction(&reveal_tx)[1]
+      ParsedEnvelope::from_transaction(&reveal_tx, &index)[1]
         .payload
         .parents(),
     );

@@ -1,19 +1,21 @@
 use {
   super::*,
-  bitcoin::blockdata::{
-    opcodes,
-    script::{
-      Instruction::{self, Op, PushBytes},
-      Instructions,
-    },
+  bitcoin::{
+    hashes::{sha256, Hash, HashEngine},
+    secp256k1::XOnlyPublicKey,
+    Transaction, TxIn, Witness,
   },
-  std::iter::Peekable,
+  std::collections::BTreeMap,
 };
+
+use bitcoin_embed::message::Message;
 
 pub(crate) const PROTOCOL_ID: [u8; 3] = *b"ord";
 pub(crate) const BODY_TAG: [u8; 0] = [];
+pub(crate) const BODY_CONTROL_BLOCK_TAG: u8 = 0;
+pub(crate) const PROTOCOL_CONTROL_BLOCK_TAG: u128 = 0x42;
 
-type Result<T> = std::result::Result<T, script::Error>;
+type Result<T, E = script::Error> = std::result::Result<T, E>;
 pub type RawEnvelope = Envelope<Vec<Vec<u8>>>;
 pub type ParsedEnvelope = Envelope<Inscription>;
 
@@ -35,7 +37,6 @@ impl From<RawEnvelope> for ParsedEnvelope {
       .position(|(i, push)| i % 2 == 0 && push.is_empty());
 
     let mut fields: BTreeMap<&[u8], Vec<&[u8]>> = BTreeMap::new();
-
     let mut incomplete_field = false;
 
     for item in envelope.payload[..body.unwrap_or(envelope.payload.len())].chunks(2) {
@@ -92,8 +93,8 @@ impl From<RawEnvelope> for ParsedEnvelope {
 }
 
 impl ParsedEnvelope {
-  pub fn from_transaction(transaction: &Transaction) -> Vec<Self> {
-    RawEnvelope::from_transaction(transaction)
+  pub fn from_transaction(transaction: &Transaction, index: &Index) -> Vec<Self> {
+    RawEnvelope::from_transaction(transaction, index)
       .into_iter()
       .map(|envelope| envelope.into())
       .collect()
@@ -101,158 +102,133 @@ impl ParsedEnvelope {
 }
 
 impl RawEnvelope {
-  pub fn from_transaction(transaction: &Transaction) -> Vec<Self> {
-    let mut envelopes = Vec::new();
+  pub fn from_transaction(transaction: &Transaction, index: &Index) -> Vec<Self> {
+    let mut envelope = Vec::new();
 
     for (i, input) in transaction.input.iter().enumerate() {
-      if let Some(tapscript) = unversioned_leaf_script_from_witness(&input.witness) {
-        if let Ok(input_envelopes) = Self::from_tapscript(tapscript, i) {
-          envelopes.extend(input_envelopes);
-        }
+      let sat_hash = Self::sat_hash_from_input(input, index);
+
+      if let Some(raw_envelope) = Self::from_control_block(&input.witness, i, sat_hash.as_ref()) {
+        envelope.extend(raw_envelope);
       }
     }
 
-    envelopes
+    envelope
   }
 
-  fn from_tapscript(tapscript: &Script, input: usize) -> Result<Vec<Self>> {
-    let mut envelopes = Vec::new();
+  fn from_control_block(
+    witness: &Witness,
+    input_index: usize,
+    sat_hash: Option<&sha256::Hash>,
+  ) -> Option<Vec<Self>> {
+    let legacy_target_key =
+      hex::decode("96053db5b18967b5a410326ecca687441579225a6d190f398e2180deec6e429e").ok()?;
 
-    let mut instructions = tapscript.instructions().peekable();
-
-    let mut stuttered = false;
-    while let Some(instruction) = instructions.next().transpose()? {
-      if instruction == PushBytes((&[]).into()) {
-        let (stutter, envelope) =
-          Self::from_instructions(&mut instructions, input, envelopes.len(), stuttered)?;
-        if let Some(envelope) = envelope {
-          envelopes.push(envelope);
-        } else {
-          stuttered = stutter;
-        }
+    let data = witness.iter().find_map(|item| {
+      if let Some(pos) = item
+        .windows(legacy_target_key.len())
+        .position(|w| w == legacy_target_key.as_slice())
+      {
+        return Some(&item[pos + legacy_target_key.len()..]);
       }
+
+      sat_hash.and_then(|hash| {
+        let tweaked_key = Self::nums_from_tag(&hash.to_byte_array()).serialize();
+        item
+          .windows(33)
+          .position(|w| w == tweaked_key)
+          .map(|pos| &item[pos + 33..])
+      })
+    })?;
+
+    let messages = Message::decode(data).ok()?;
+
+    let mut envelope = Vec::new();
+
+    for msg in messages {
+      if msg.tag != PROTOCOL_CONTROL_BLOCK_TAG {
+        continue;
+      }
+
+      let mut payload = Vec::new();
+      let mut index = 0;
+      let mut invalid = msg.body.len() == 1;
+
+      while index + 1 < msg.body.len() {
+        let tag = msg.body[index];
+
+        if tag == BODY_CONTROL_BLOCK_TAG {
+          payload.push(BODY_TAG.to_vec());
+          payload.push(msg.body[index + 1..].to_vec());
+          break;
+        }
+
+        let Ok((length, size)) = bitcoin_embed::varint::decode(&msg.body[index + 1..]) else {
+          invalid = true;
+          break;
+        };
+
+        if length > u32::MAX as u128 {
+          invalid = true;
+          break;
+        }
+
+        let length = length as usize;
+        if index + 1 + size + length > msg.body.len() {
+          invalid = true;
+          break;
+        }
+
+        payload.push(vec![tag]);
+        payload.push(msg.body[index + 1 + size..index + 1 + size + length].to_vec());
+        index += 1 + size + length;
+      }
+
+      if invalid {
+        continue;
+      }
+
+      envelope.push(Self {
+        input: input_index.try_into().ok()?,
+        offset: envelope.len().try_into().ok()?,
+        payload,
+        pushnum: false,
+        stutter: false,
+      });
     }
 
-    Ok(envelopes)
+    (!envelope.is_empty()).then_some(envelope)
   }
 
-  fn accept(instructions: &mut Peekable<Instructions>, instruction: Instruction) -> Result<bool> {
-    if instructions.peek() == Some(&Ok(instruction)) {
-      instructions.next().transpose()?;
-      Ok(true)
-    } else {
-      Ok(false)
-    }
+  fn sat_hash_from_input(input: &TxIn, index: &Index) -> Option<sha256::Hash> {
+    index
+      .get_output_info(input.previous_output)
+      .ok()
+      .flatten()
+      .and_then(|(output_info, _)| {
+        output_info
+          .sat_ranges
+          .as_ref()
+          .and_then(|ranges| ranges.iter().map(|(start, _)| *start).min())
+          .map(|lowest_sat| {
+            let sat_key = Self::nums_from_tag(&lowest_sat.to_le_bytes());
+            sha256::Hash::hash(&sat_key.serialize())
+          })
+      })
   }
 
-  fn from_instructions(
-    instructions: &mut Peekable<Instructions>,
-    input: usize,
-    offset: usize,
-    stutter: bool,
-  ) -> Result<(bool, Option<Self>)> {
-    if !Self::accept(instructions, Op(opcodes::all::OP_IF))? {
-      let stutter = instructions.peek() == Some(&Ok(PushBytes((&[]).into())));
-      return Ok((stutter, None));
-    }
-
-    if !Self::accept(instructions, PushBytes((&PROTOCOL_ID).into()))? {
-      let stutter = instructions.peek() == Some(&Ok(PushBytes((&[]).into())));
-      return Ok((stutter, None));
-    }
-
-    let mut pushnum = false;
-
-    let mut payload = Vec::new();
-
+  fn nums_from_tag(tag: &[u8]) -> XOnlyPublicKey {
+    let mut ctr = 0u32;
     loop {
-      match instructions.next().transpose()? {
-        None => return Ok((false, None)),
-        Some(Op(opcodes::all::OP_ENDIF)) => {
-          return Ok((
-            false,
-            Some(Envelope {
-              input: input.try_into().unwrap(),
-              offset: offset.try_into().unwrap(),
-              payload,
-              pushnum,
-              stutter,
-            }),
-          ));
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_NEG1)) => {
-          pushnum = true;
-          payload.push(vec![0x81]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_1)) => {
-          pushnum = true;
-          payload.push(vec![1]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_2)) => {
-          pushnum = true;
-          payload.push(vec![2]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_3)) => {
-          pushnum = true;
-          payload.push(vec![3]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_4)) => {
-          pushnum = true;
-          payload.push(vec![4]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_5)) => {
-          pushnum = true;
-          payload.push(vec![5]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_6)) => {
-          pushnum = true;
-          payload.push(vec![6]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_7)) => {
-          pushnum = true;
-          payload.push(vec![7]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_8)) => {
-          pushnum = true;
-          payload.push(vec![8]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_9)) => {
-          pushnum = true;
-          payload.push(vec![9]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_10)) => {
-          pushnum = true;
-          payload.push(vec![10]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_11)) => {
-          pushnum = true;
-          payload.push(vec![11]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_12)) => {
-          pushnum = true;
-          payload.push(vec![12]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_13)) => {
-          pushnum = true;
-          payload.push(vec![13]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_14)) => {
-          pushnum = true;
-          payload.push(vec![14]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_15)) => {
-          pushnum = true;
-          payload.push(vec![15]);
-        }
-        Some(Op(opcodes::all::OP_PUSHNUM_16)) => {
-          pushnum = true;
-          payload.push(vec![16]);
-        }
-        Some(PushBytes(push)) => {
-          payload.push(push.as_bytes().to_vec());
-        }
-        Some(_) => return Ok((false, None)),
+      let mut eng = sha256::Hash::engine();
+      eng.input(tag);
+      eng.input(&ctr.to_le_bytes());
+      let candidate = sha256::Hash::from_engine(eng);
+
+      if let Ok(pk) = XOnlyPublicKey::from_slice(&candidate.to_byte_array()) {
+        return pk;
       }
+      ctr += 1;
     }
   }
 }
@@ -262,20 +238,23 @@ mod tests {
   use super::*;
 
   fn parse(witnesses: &[Witness]) -> Vec<ParsedEnvelope> {
-    ParsedEnvelope::from_transaction(&Transaction {
-      version: Version(2),
-      lock_time: LockTime::ZERO,
-      input: witnesses
-        .iter()
-        .map(|witness| TxIn {
-          previous_output: OutPoint::null(),
-          script_sig: ScriptBuf::new(),
-          sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-          witness: witness.clone(),
-        })
-        .collect(),
-      output: Vec::new(),
-    })
+    ParsedEnvelope::from_transaction(
+      &Transaction {
+        version: Version(2),
+        lock_time: LockTime::ZERO,
+        input: witnesses
+          .iter()
+          .map(|witness| TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: witness.clone(),
+          })
+          .collect(),
+        output: Vec::new(),
+      },
+      &Index::open(&settings::Settings::default()).unwrap(),
+    )
   }
 
   #[test]
